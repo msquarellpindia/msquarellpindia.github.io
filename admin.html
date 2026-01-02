@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Playlist Admin</title>
+  <style>
+    body { margin: 18px; font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    h1 { margin: 0 0 10px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+    input[type="password"], input[type="text"] { padding: 8px; min-width: 320px; }
+    button { padding: 8px 10px; cursor: pointer; }
+    .muted { color: #666; }
+    .warn { color: #b00020; }
+    .ok { color: #0a7a0a; }
+    .box { border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
+    ul { list-style: none; padding: 0; margin: 10px 0 0; }
+    li {
+      display: flex; gap: 10px; align-items: center;
+      padding: 10px; border: 1px solid #eee; border-radius: 8px;
+      margin: 8px 0; background: #fafafa;
+    }
+    li.dragging { opacity: 0.6; }
+    .handle { cursor: grab; user-select: none; font-size: 18px; }
+    .name { flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #eee; }
+    progress { width: 280px; height: 16px; }
+    .footer { margin-top: 14px; }
+    a { color: inherit; }
+  </style>
+</head>
+<body>
+  <h1>Playlist Admin</h1>
+  <div class="row muted">
+    This page uses your GitHub PAT in <code>localStorage</code> and talks directly to the GitHub API.
+  </div>
+
+  <div class="box">
+    <div class="row">
+      <label>
+        PAT:
+        <input id="token" type="password" placeholder="ghp_..." autocomplete="off" />
+      </label>
+      <button id="saveToken">Save</button>
+      <button id="clearToken">Clear</button>
+      <span id="authStatus" class="pill">Not connected</span>
+    </div>
+
+    <div class="row">
+      <button id="refresh">Refresh</button>
+      <button id="saveOrder">Save order to videos.json</button>
+      <span id="repoInfo" class="muted"></span>
+    </div>
+
+    <div class="row">
+      <label>
+        Upload video(s):
+        <input id="fileInput" type="file" accept="video/*" multiple />
+      </label>
+      <button id="upload">Upload</button>
+      <progress id="prog" value="0" max="100" style="display:none;"></progress>
+      <span id="uploadMsg" class="muted"></span>
+    </div>
+
+    <div id="msg" class="row"></div>
+  </div>
+
+  <div class="box" style="margin-top: 14px;">
+    <div class="row">
+      <strong>Playlist (drag to reorder)</strong>
+      <span class="muted">— stored in <code>videos.json</code></span>
+    </div>
+    <ul id="list"></ul>
+
+    <div class="footer muted">
+      Tip: keep the player open at <a href="./index.html" target="_blank" rel="noreferrer">index.html</a>.
+    </div>
+  </div>
+
+  <script type="module" src="./assets/admin.js"></script>
+</body>
+</html>
