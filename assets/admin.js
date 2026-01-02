@@ -191,7 +191,6 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
       continue;
     }
 
-    // Completed
     if (run.conclusion === "success") {
       setActionsPanel({
         stateText: "Completed",
@@ -227,6 +226,53 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
   });
 }
 
+/** ---------- XHR helper (for reliable large uploads + progress) ---------- **/
+
+function ghXhrJson(url, { token, method = "GET", jsonBodyText = "", onUploadProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url, true);
+
+    xhr.setRequestHeader("Accept", "application/vnd.github+json");
+    xhr.setRequestHeader("X-GitHub-Api-Version", "2022-11-28");
+    xhr.setRequestHeader("Content-Type", "application/json; charset=utf-8");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${String(token).trim()}`);
+
+    if (xhr.upload && typeof onUploadProgress === "function") {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          onUploadProgress(pct, e.loaded, e.total);
+        } else {
+          onUploadProgress(null, e.loaded, null);
+        }
+      };
+    }
+
+    xhr.onerror = () => reject(new Error("Network error (XHR)"));
+    xhr.ontimeout = () => reject(new Error("Request timed out (XHR)"));
+
+    xhr.onload = () => {
+      const status = xhr.status;
+      const text = xhr.responseText || "";
+      let json = null;
+      try { json = text ? JSON.parse(text) : null; } catch { /* ignore */ }
+
+      if (status >= 200 && status < 300) {
+        resolve(json);
+      } else {
+        const msg = json?.message || text || `HTTP ${status}`;
+        const err = new Error(msg);
+        err.status = status;
+        err.details = json;
+        reject(err);
+      }
+    };
+
+    xhr.send(jsonBodyText);
+  });
+}
+
 /** ---------- Auth & repo ---------- **/
 
 async function validateToken() {
@@ -257,7 +303,7 @@ async function listVideosFolder() {
   try {
     items = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos`), { token });
   } catch (e) {
-    if (e.status === 404) return; // folder doesn't exist yet
+    if (e.status === 404) return;
     throw e;
   }
 
@@ -329,18 +375,9 @@ function renderList() {
     del.addEventListener("click", async () => {
       try {
         setMessage(`Deleting ${name}…`, "muted");
-        setActionsPanel({
-          stateText: "Idle",
-          stateKind: "muted",
-          commit: "—",
-          workflow: "—",
-          runText: "—",
-          runUrl: null,
-          notes: "Waiting for change to be saved…",
-        });
+        setActionsPanel({ notes: "Waiting for change to be saved…" });
 
         const commitSha = await deleteVideo(name);
-
         playlist = playlist.filter(v => v !== name);
 
         setMessage(`Updating videos.json…`, "muted");
@@ -352,15 +389,7 @@ function renderList() {
         await pollActionsForCommit(jsonCommit || commitSha);
       } catch (e) {
         setMessage(`Delete failed: ${e.message}`, "warn");
-        setActionsPanel({
-          stateText: "Error",
-          stateKind: "warn",
-          commit: "—",
-          workflow: "—",
-          runText: "—",
-          runUrl: null,
-          notes: e.message,
-        });
+        setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
       }
     });
 
@@ -444,10 +473,10 @@ async function uploadOneFile(file) {
     name = `${base}_${n}${ext}`;
   }
 
-  // Encoding progress
+  // Phase 1: encoding progress (deterministic)
   els.prog.style.display = "";
-  els.prog.value = 0;
   els.prog.max = 100;
+  els.prog.value = 0;
   els.uploadMsg.textContent = `Encoding: ${file.name}`;
 
   const buf = await file.arrayBuffer();
@@ -455,23 +484,34 @@ async function uploadOneFile(file) {
     els.prog.value = pct;
   });
 
-  // Upload phase (indeterminate)
+  // Phase 2: upload progress (REAL network progress via XHR)
   els.uploadMsg.textContent = `Uploading: ${name}`;
-  els.prog.removeAttribute("value");
+  els.prog.value = 0;
 
   const payload = {
     message: `Upload video ${name}`,
     content: b64,
   };
 
-  const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos/${encodeURIComponent(name)}`), {
+  const url = api(`/repos/${owner}/${repo}/contents/videos/${encodeURIComponent(name)}`);
+  const jsonText = JSON.stringify(payload);
+
+  const j = await ghXhrJson(url, {
     token,
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    jsonBodyText: jsonText,
+    onUploadProgress: (pct) => {
+      if (typeof pct === "number") {
+        els.prog.value = pct;
+      } else {
+        // length not computable — show indeterminate
+        els.prog.removeAttribute("value");
+      }
+    }
   });
 
-  // Back to determinate
+  // Restore determinate bar after completion
+  els.prog.max = 100;
   els.prog.value = 100;
 
   videosFolderMap.set(name, { sha: j?.content?.sha, path: `videos/${name}` });
@@ -567,15 +607,7 @@ els.saveOrder.addEventListener("click", async () => {
   try {
     requireToken();
     setMessage("Saving videos.json…", "muted");
-    setActionsPanel({
-      stateText: "Idle",
-      stateKind: "muted",
-      commit: "—",
-      workflow: "—",
-      runText: "—",
-      runUrl: null,
-      notes: "Saving…",
-    });
+    setActionsPanel({ notes: "Saving…" });
 
     const commitSha = await saveVideosJson();
     setMessage("Saved videos.json order.", "ok");
@@ -583,15 +615,7 @@ els.saveOrder.addEventListener("click", async () => {
     await pollActionsForCommit(commitSha);
   } catch (e) {
     setMessage(`Save failed: ${e.message}`, "warn");
-    setActionsPanel({
-      stateText: "Error",
-      stateKind: "warn",
-      commit: "—",
-      workflow: "—",
-      runText: "—",
-      runUrl: null,
-      notes: e.message,
-    });
+    setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
   }
 });
 
@@ -602,6 +626,8 @@ els.upload.addEventListener("click", async () => {
     if (!files.length) { setMessage("Choose one or more video files first.", "warn"); return; }
 
     els.prog.style.display = "";
+    els.prog.max = 100;
+    els.prog.value = 0;
     els.uploadMsg.textContent = "";
     setMessage("Starting upload…", "muted");
 
@@ -635,15 +661,7 @@ els.upload.addEventListener("click", async () => {
 
   } catch (e) {
     setMessage(`Upload failed: ${e.message}`, "warn");
-    setActionsPanel({
-      stateText: "Error",
-      stateKind: "warn",
-      commit: "—",
-      workflow: "—",
-      runText: "—",
-      runUrl: null,
-      notes: e.message,
-    });
+    setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
   } finally {
     setTimeout(() => {
       els.prog.style.display = "none";
