@@ -27,6 +27,7 @@
     progress { width: 280px; height: 16px; }
     .footer { margin-top: 14px; }
     a { color: inherit; }
+    code { background: rgba(0,0,0,.04); padding: 1px 5px; border-radius: 6px; }
 
     /* Actions Status panel */
     .actions-grid {
@@ -43,7 +44,6 @@
     .actions-pill.warn { background: rgba(176,0,32,.12); color: #b00020; }
     .actions-pill.muted { background: rgba(0,0,0,.06); color: #555; }
     .actions-link { text-decoration: underline; cursor: pointer; }
-    code { background: rgba(0,0,0,.04); padding: 1px 5px; border-radius: 6px; }
   </style>
 </head>
 <body>
@@ -51,10 +51,17 @@
 
   <div class="row muted">
     This page uses your GitHub PAT in <code>localStorage</code> and talks directly to the GitHub API.
-    Videos are stored as <strong>GitHub Release assets</strong> (binary-friendly).
+    Videos are stored as <strong>GitHub Release assets</strong>.
   </div>
 
   <div class="box">
+    <div class="row warn" style="margin-top: 0;">
+      <strong>Important:</strong>
+      GitHub Release asset uploads use <code>uploads.github.com</code>, which does not allow browser CORS uploads.
+      So uploading from this page is not possible without a backend/proxy.
+      Use the button below to upload on GitHub, then click Refresh here.
+    </div>
+
     <div class="row">
       <label>
         PAT:
@@ -68,22 +75,13 @@
     <div class="row">
       <button id="refresh">Refresh</button>
       <button id="saveOrder">Save order to videos.json</button>
+      <button id="openReleaseUpload">Open Release Upload Page</button>
       <span id="repoInfo" class="muted"></span>
     </div>
 
     <div class="row muted" style="margin-top: 0;">
       Storage: Release tag <code>signboard-assets</code><br/>
       Playlist file: <code>videos.json</code> (stores stable download URLs)
-    </div>
-
-    <div class="row">
-      <label>
-        Upload video(s) as Release assets:
-        <input id="fileInput" type="file" accept="video/*" multiple />
-      </label>
-      <button id="upload">Upload</button>
-      <progress id="prog" value="0" max="100" style="display:none;"></progress>
-      <span id="uploadMsg" class="muted"></span>
     </div>
 
     <div id="msg" class="row"></div>

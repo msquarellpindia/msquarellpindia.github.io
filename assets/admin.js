@@ -6,8 +6,8 @@ import {
 } from "./common.js";
 
 const TOKEN_KEY = "gh_pat";
-const RELEASE_TAG = "signboard-assets"; // Pattern B fixed tag
-const RELEASE_NAME = "Signboard Assets"; // shown in GitHub UI if we create it
+const RELEASE_TAG = "signboard-assets";
+const RELEASE_NAME = "Signboard Assets";
 
 const els = {
   token: document.getElementById("token"),
@@ -16,11 +16,8 @@ const els = {
   authStatus: document.getElementById("authStatus"),
   refresh: document.getElementById("refresh"),
   saveOrder: document.getElementById("saveOrder"),
+  openReleaseUpload: document.getElementById("openReleaseUpload"),
   repoInfo: document.getElementById("repoInfo"),
-  fileInput: document.getElementById("fileInput"),
-  upload: document.getElementById("upload"),
-  prog: document.getElementById("prog"),
-  uploadMsg: document.getElementById("uploadMsg"),
   msg: document.getElementById("msg"),
   list: document.getElementById("list"),
 
@@ -40,11 +37,11 @@ els.repoInfo.textContent = `Repo inferred: ${owner}/${repo}`;
 let token = lsGet(TOKEN_KEY) || "";
 els.token.value = token;
 
-let videosJsonSha = null;           // sha for videos.json
-let playlist = [];                  // array of URLs (Pattern B)
-let release = null;                 // release object
-let assetsByName = new Map();       // name -> meta
-let assetsByUrl = new Map();        // stable url -> meta
+let videosJsonSha = null;
+let playlist = [];             // stable URLs
+let release = null;            // release object
+let assetsByName = new Map();  // name -> meta
+let assetsByUrl = new Map();   // stable url -> meta
 
 function setStatus(text, cls) {
   els.authStatus.textContent = text;
@@ -63,9 +60,6 @@ function requireToken() {
 }
 function api(path) {
   return `https://api.github.com${path}`;
-}
-function uploads(path) {
-  return `https://uploads.github.com${path}`;
 }
 
 /** ---------- Actions Status panel helpers ---------- **/
@@ -120,10 +114,6 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
     setActionsPanel({
       stateText: "Idle",
       stateKind: "muted",
-      commit: "—",
-      workflow: "—",
-      runText: "—",
-      runUrl: null,
       notes: "No commit SHA to poll.",
     });
     return;
@@ -151,24 +141,12 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
         stateText: "Unavailable",
         stateKind: "warn",
         commit: shortSha,
-        workflow: "—",
-        runText: "—",
-        runUrl: null,
         notes: `Actions polling unavailable: ${e.message}`,
       });
       return;
     }
 
     if (!run) {
-      setActionsPanel({
-        stateText: "Polling…",
-        stateKind: "muted",
-        commit: shortSha,
-        workflow: "Searching…",
-        runText: "No run yet — retrying…",
-        runUrl: null,
-        notes: "GitHub may take a few seconds to register the workflow run.",
-      });
       await sleep(intervalMs);
       continue;
     }
@@ -191,42 +169,28 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
       continue;
     }
 
-    if (run.conclusion === "success") {
-      setActionsPanel({
-        stateText: "Completed",
-        stateKind: "ok",
-        commit: shortSha,
-        workflow: String(wfName),
-        runText: pretty,
-        runUrl: url,
-        notes: "Workflow succeeded.",
-      });
-    } else {
-      setActionsPanel({
-        stateText: "Completed",
-        stateKind: "warn",
-        commit: shortSha,
-        workflow: String(wfName),
-        runText: pretty,
-        runUrl: url,
-        notes: "Workflow not successful — open the run for logs.",
-      });
-    }
+    setActionsPanel({
+      stateText: "Completed",
+      stateKind: run.conclusion === "success" ? "ok" : "warn",
+      commit: shortSha,
+      workflow: String(wfName),
+      runText: pretty,
+      runUrl: url,
+      notes: run.conclusion === "success"
+        ? "Workflow succeeded."
+        : "Workflow not successful — open the run for logs.",
+    });
     return;
   }
 
   setActionsPanel({
     stateText: "Timed out",
     stateKind: "warn",
-    commit: shortSha,
-    workflow: "—",
-    runText: "—",
-    runUrl: null,
     notes: "Timed out waiting for workflow run.",
   });
 }
 
-/** ---------- Filename normalization ---------- **/
+/** ---------- Filename normalization (for guidance / future use) ---------- **/
 
 function normalizeFileName(originalName) {
   const raw = sanitizeFileName(originalName || "video") || "video";
@@ -239,7 +203,6 @@ function normalizeFileName(originalName) {
   ext = ext.toLowerCase();
 
   if (!base) base = "video";
-
   const out = `${base}${ext}`.replace(/\.+$/g, "");
   return out.slice(0, 180);
 }
@@ -253,7 +216,6 @@ function stableDownloadUrl(assetName) {
 async function ensureRelease() {
   requireToken();
 
-  // Try get by tag
   try {
     release = await ghFetch(api(`/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(RELEASE_TAG)}`), { token });
     return release;
@@ -261,7 +223,7 @@ async function ensureRelease() {
     if (e.status !== 404) throw e;
   }
 
-  // Create release (FIX: make_latest must be a string)
+  // Create release
   release = await ghFetch(api(`/repos/${owner}/${repo}/releases`), {
     token,
     method: "POST",
@@ -284,6 +246,7 @@ async function loadReleaseAssets() {
   await ensureRelease();
 
   const arr = await ghFetch(api(`/repos/${owner}/${repo}/releases/${release.id}/assets?per_page=100`), { token });
+
   assetsByName.clear();
   assetsByUrl.clear();
 
@@ -298,10 +261,7 @@ async function loadReleaseAssets() {
         download_count: a.download_count,
       };
       assetsByName.set(a.name, meta);
-
-      // We store stable URLs in videos.json, so map stable URL -> meta
-      const stable = stableDownloadUrl(a.name);
-      assetsByUrl.set(stable, meta);
+      assetsByUrl.set(stableDownloadUrl(a.name), meta);
     }
   }
 }
@@ -355,48 +315,7 @@ async function saveVideosJson() {
   return j?.commit?.sha || null;
 }
 
-/** ---------- Upload release asset with XHR + progress ---------- **/
-
-function uploadReleaseAssetXhr({ releaseId, name, file }) {
-  return new Promise((resolve, reject) => {
-    const url = uploads(`/repos/${owner}/${repo}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`);
-
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", url, true);
-
-    xhr.setRequestHeader("Accept", "application/vnd.github+json");
-    xhr.setRequestHeader("X-GitHub-Api-Version", "2022-11-28");
-    xhr.setRequestHeader("Authorization", `Bearer ${String(token).trim()}`);
-    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        els.prog.value = pct;
-      }
-    };
-
-    xhr.onerror = () => reject(new Error("Network error while uploading asset"));
-    xhr.onload = () => {
-      const status = xhr.status;
-      const text = xhr.responseText || "";
-      let json = null;
-      try { json = text ? JSON.parse(text) : null; } catch {}
-
-      if (status >= 200 && status < 300) {
-        resolve(json);
-      } else {
-        const msg = json?.message || text || `HTTP ${status}`;
-        const err = new Error(msg);
-        err.status = status;
-        err.details = json;
-        reject(err);
-      }
-    };
-
-    xhr.send(file);
-  });
-}
+/** ---------- Delete release asset ---------- **/
 
 async function deleteReleaseAsset(assetId) {
   requireToken();
@@ -408,12 +327,22 @@ async function deleteReleaseAsset(assetId) {
 
 /** ---------- UI rendering ---------- **/
 
+function displayLabelForUrl(url) {
+  // Nicer UI: show just asset name if it matches our stable URL pattern
+  const prefix = `https://github.com/${owner}/${repo}/releases/download/${RELEASE_TAG}/`;
+  if (typeof url === "string" && url.startsWith(prefix)) {
+    const rest = url.slice(prefix.length);
+    try { return decodeURIComponent(rest); } catch { return rest; }
+  }
+  return url;
+}
+
 function renderList() {
   els.list.innerHTML = "";
 
   if (!playlist.length) {
     const li = document.createElement("li");
-    li.textContent = "No videos yet. Upload some files.";
+    li.textContent = "No videos yet. Upload assets on GitHub, then Refresh.";
     els.list.appendChild(li);
     return;
   }
@@ -429,7 +358,7 @@ function renderList() {
 
     const nm = document.createElement("span");
     nm.className = "name";
-    nm.textContent = url;
+    nm.textContent = displayLabelForUrl(url);
 
     const asset = assetsByUrl.get(url);
     const exists = document.createElement("span");
@@ -525,10 +454,10 @@ async function refreshAll() {
     await loadReleaseAssets();
     await loadPlaylist();
 
-    // Reconcile: keep only entries that match current assets
+    // Reconcile playlist with current assets (Pattern B stable URLs)
     playlist = playlist.filter(u => assetsByUrl.has(u));
 
-    // Append any assets not in playlist
+    // Append assets not in playlist (optional)
     for (const [name] of assetsByName.entries()) {
       const stable = stableDownloadUrl(name);
       if (!playlist.includes(stable)) playlist.push(stable);
@@ -552,44 +481,26 @@ async function refreshAll() {
   }
 }
 
-/** ---------- Upload flow ---------- **/
-
-async function uploadOneFile(file) {
-  requireToken();
-  await ensureRelease();
-
-  const normalized = normalizeFileName(file.name);
-  let name = normalized;
-
-  if (assetsByName.has(name)) {
-    const dot = name.lastIndexOf(".");
-    const base = dot >= 0 ? name.slice(0, dot) : name;
-    const ext = dot >= 0 ? name.slice(dot) : "";
-    let n = 2;
-    while (assetsByName.has(`${base}_${n}${ext}`)) n++;
-    name = `${base}_${n}${ext}`;
-  }
-
-  els.prog.style.display = "";
-  els.prog.max = 100;
-  els.prog.value = 0;
-  els.uploadMsg.textContent = `Uploading asset: ${name}`;
-
-  await uploadReleaseAssetXhr({
-    releaseId: release.id,
-    name,
-    file
-  });
-
-  await loadReleaseAssets();
-
-  const stable = stableDownloadUrl(name);
-  if (!playlist.includes(stable)) playlist.push(stable);
-
-  return stable;
-}
-
 /** ---------- UI wiring ---------- **/
+
+els.openReleaseUpload.addEventListener("click", async () => {
+  try {
+    requireToken();
+    await ensureRelease();
+
+    // Open the GitHub UI page where the user can upload assets to this release.
+    // This avoids the uploads.github.com CORS limitation.
+    const url = `https://github.com/${owner}/${repo}/releases/tag/${encodeURIComponent(RELEASE_TAG)}`;
+    window.open(url, "_blank", "noreferrer");
+
+    setMessage(
+      `Opened GitHub release page. Upload files there (use normalized names like: ${normalizeFileName("My Promo Video (Final).MP4")}). Then come back and click Refresh.`,
+      "muted"
+    );
+  } catch (e) {
+    setMessage(`Could not open release page: ${e.message}`, "warn");
+  }
+});
 
 els.saveToken.addEventListener("click", async () => {
   token = (els.token.value || "").trim();
@@ -633,51 +544,6 @@ els.saveOrder.addEventListener("click", async () => {
   } catch (e) {
     setMessage(`Save failed: ${e.message}`, "warn");
     setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
-  }
-});
-
-els.upload.addEventListener("click", async () => {
-  try {
-    requireToken();
-    const files = [...(els.fileInput.files || [])];
-    if (!files.length) { setMessage("Choose one or more video files first.", "warn"); return; }
-
-    setMessage("Starting upload…", "muted");
-    setActionsPanel({
-      stateText: "Idle",
-      stateKind: "muted",
-      commit: "—",
-      workflow: "—",
-      runText: "—",
-      runUrl: null,
-      notes: "Uploading assets… videos.json update will trigger workflow polling.",
-    });
-
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      setMessage(`Uploading ${i + 1}/${files.length}: ${f.name}`, "muted");
-      await uploadOneFile(f);
-    }
-
-    setMessage("Updating videos.json…", "muted");
-    const commitSha = await saveVideosJson();
-
-    renderList();
-    els.uploadMsg.textContent = `Uploaded ${files.length} file(s) and updated videos.json.`;
-    setMessage("Upload complete.", "ok");
-
-    await pollActionsForCommit(commitSha);
-
-  } catch (e) {
-    setMessage(`Upload failed: ${e.message}`, "warn");
-    setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
-  } finally {
-    setTimeout(() => {
-      els.prog.style.display = "none";
-      els.uploadMsg.textContent = "";
-      els.prog.value = 0;
-      els.prog.max = 100;
-    }, 1200);
   }
 });
 
