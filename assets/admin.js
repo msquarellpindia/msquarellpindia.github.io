@@ -39,6 +39,7 @@ els.repoInfo.textContent = `Repo inferred: ${owner}/${repo}`;
 let token = lsGet(TOKEN_KEY) || "";
 els.token.value = token;
 
+let defaultBranch = "main";       // fetched from repo metadata
 let videosJsonSha = null;         // sha for videos.json (needed for updates)
 let videosFolderMap = new Map();  // filename -> { sha, path }
 let playlist = [];                // ordered list of filenames
@@ -58,7 +59,6 @@ function setMessage(text, cls) {
 function requireToken() {
   if (!token) throw new Error("No PAT set. Paste a token and click Save.");
 }
-
 function api(path) {
   return `https://api.github.com${path}`;
 }
@@ -68,7 +68,6 @@ function api(path) {
 function nowLocalString() {
   return new Date().toLocaleString();
 }
-
 function setActionsPanel({
   stateText = "Idle",
   stateKind = "muted", // "muted" | "ok" | "warn"
@@ -101,19 +100,16 @@ function setActionsPanel({
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
-
 function formatRun(run) {
   const s = run?.status || "unknown";
   const c = run?.conclusion ? ` / ${run.conclusion}` : "";
   return `${s}${c}`;
 }
-
 async function findRunForCommit(commitSha) {
   const runs = await ghFetch(api(`/repos/${owner}/${repo}/actions/runs?per_page=20`), { token });
   const arr = runs?.workflow_runs || [];
   return arr.find(r => r.head_sha === commitSha) || null;
 }
-
 async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs = 3000 } = {}) {
   if (!commitSha) {
     setActionsPanel({
@@ -226,51 +222,100 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
   });
 }
 
-/** ---------- XHR helper (for reliable large uploads + progress) ---------- **/
+/** ---------- Git Database API (used directly for uploads) ---------- **/
 
-function ghXhrJson(url, { token, method = "GET", jsonBodyText = "", onUploadProgress } = {}) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open(method, url, true);
-
-    xhr.setRequestHeader("Accept", "application/vnd.github+json");
-    xhr.setRequestHeader("X-GitHub-Api-Version", "2022-11-28");
-    xhr.setRequestHeader("Content-Type", "application/json; charset=utf-8");
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${String(token).trim()}`);
-
-    if (xhr.upload && typeof onUploadProgress === "function") {
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 100);
-          onUploadProgress(pct, e.loaded, e.total);
-        } else {
-          onUploadProgress(null, e.loaded, null);
-        }
-      };
-    }
-
-    xhr.onerror = () => reject(new Error("Network error (XHR)"));
-    xhr.ontimeout = () => reject(new Error("Request timed out (XHR)"));
-
-    xhr.onload = () => {
-      const status = xhr.status;
-      const text = xhr.responseText || "";
-      let json = null;
-      try { json = text ? JSON.parse(text) : null; } catch { /* ignore */ }
-
-      if (status >= 200 && status < 300) {
-        resolve(json);
-      } else {
-        const msg = json?.message || text || `HTTP ${status}`;
-        const err = new Error(msg);
-        err.status = status;
-        err.details = json;
-        reject(err);
-      }
-    };
-
-    xhr.send(jsonBodyText);
+async function getHeadCommitSha(branch) {
+  const ref = await ghFetch(api(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`), { token });
+  return ref?.object?.sha;
+}
+async function getCommit(commitSha) {
+  return ghFetch(api(`/repos/${owner}/${repo}/git/commits/${commitSha}`), { token });
+}
+async function createBlobBase64(b64) {
+  return ghFetch(api(`/repos/${owner}/${repo}/git/blobs`), {
+    token,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: b64, encoding: "base64" })
   });
+}
+async function createTreeWithFile({ baseTreeSha, path, blobSha }) {
+  return ghFetch(api(`/repos/${owner}/${repo}/git/trees`), {
+    token,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      base_tree: baseTreeSha,
+      tree: [{
+        path,
+        mode: "100644",
+        type: "blob",
+        sha: blobSha
+      }]
+    })
+  });
+}
+async function createCommit({ message, treeSha, parentSha }) {
+  return ghFetch(api(`/repos/${owner}/${repo}/git/commits`), {
+    token,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message,
+      tree: treeSha,
+      parents: [parentSha]
+    })
+  });
+}
+async function updateBranchRef({ branch, newCommitSha }) {
+  return ghFetch(api(`/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`), {
+    token,
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sha: newCommitSha, force: false })
+  });
+}
+
+/**
+ * Upload/create/overwrite a single file via Git Data API.
+ * Shows stage-style progress (not true network upload progress).
+ */
+async function uploadViaGitData({ repoPath, base64Content, message, onStage }) {
+  requireToken();
+
+  const stage = (pct, text) => {
+    if (typeof onStage === "function") onStage(pct, text);
+  };
+
+  stage(5, "Resolving branch head…");
+  const headSha = await getHeadCommitSha(defaultBranch);
+  if (!headSha) throw new Error(`Could not resolve head for branch ${defaultBranch}`);
+
+  stage(15, "Reading head commit…");
+  const headCommit = await getCommit(headSha);
+  const baseTreeSha = headCommit?.tree?.sha;
+  if (!baseTreeSha) throw new Error("Could not resolve base tree");
+
+  stage(40, "Creating blob…");
+  const blob = await createBlobBase64(base64Content);
+  const blobSha = blob?.sha;
+  if (!blobSha) throw new Error("Failed to create blob");
+
+  stage(65, "Creating tree…");
+  const tree = await createTreeWithFile({ baseTreeSha, path: repoPath, blobSha });
+  const treeSha = tree?.sha;
+  if (!treeSha) throw new Error("Failed to create tree");
+
+  stage(82, "Creating commit…");
+  const commit = await createCommit({ message, treeSha, parentSha: headSha });
+  const newCommitSha = commit?.sha;
+  if (!newCommitSha) throw new Error("Failed to create commit");
+
+  stage(95, "Updating branch ref…");
+  await updateBranchRef({ branch: defaultBranch, newCommitSha });
+
+  stage(100, "Done");
+  return newCommitSha;
 }
 
 /** ---------- Auth & repo ---------- **/
@@ -278,7 +323,8 @@ function ghXhrJson(url, { token, method = "GET", jsonBodyText = "", onUploadProg
 async function validateToken() {
   if (!token) { setStatus("Not connected"); return false; }
   try {
-    await ghFetch(api(`/repos/${owner}/${repo}`), { token });
+    const meta = await ghFetch(api(`/repos/${owner}/${repo}`), { token });
+    defaultBranch = meta?.default_branch || defaultBranch;
     setStatus("Connected", "ok");
     return true;
   } catch (e) {
@@ -455,7 +501,7 @@ async function saveVideosJson() {
   return j?.commit?.sha || null;
 }
 
-/** ---------- Upload & delete (return commit sha) ---------- **/
+/** ---------- Upload & delete ---------- **/
 
 async function uploadOneFile(file) {
   requireToken();
@@ -484,40 +530,25 @@ async function uploadOneFile(file) {
     els.prog.value = pct;
   });
 
-  // Phase 2: upload progress (REAL network progress via XHR)
-  els.uploadMsg.textContent = `Uploading: ${name}`;
+  // Phase 2: Git Data stages
   els.prog.value = 0;
+  els.uploadMsg.textContent = `Uploading (Git Data API): ${name}`;
 
-  const payload = {
+  const commitSha = await uploadViaGitData({
+    repoPath: `videos/${name}`,
+    base64Content: b64,
     message: `Upload video ${name}`,
-    content: b64,
-  };
-
-  const url = api(`/repos/${owner}/${repo}/contents/videos/${encodeURIComponent(name)}`);
-  const jsonText = JSON.stringify(payload);
-
-  const j = await ghXhrJson(url, {
-    token,
-    method: "PUT",
-    jsonBodyText: jsonText,
-    onUploadProgress: (pct) => {
-      if (typeof pct === "number") {
-        els.prog.value = pct;
-      } else {
-        // length not computable — show indeterminate
-        els.prog.removeAttribute("value");
-      }
+    onStage: (pct, text) => {
+      els.prog.value = pct;
+      els.uploadMsg.textContent = `${text}`;
     }
   });
 
-  // Restore determinate bar after completion
-  els.prog.max = 100;
-  els.prog.value = 100;
-
-  videosFolderMap.set(name, { sha: j?.content?.sha, path: `videos/${name}` });
+  // Refresh folder map so delete works later
+  await listVideosFolder();
   if (!playlist.includes(name)) playlist.push(name);
 
-  return j?.commit?.sha || null;
+  return commitSha;
 }
 
 async function deleteVideo(name) {
