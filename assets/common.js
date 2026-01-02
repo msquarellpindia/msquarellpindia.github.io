@@ -25,19 +25,10 @@ export function inferOwnerRepo() {
 
   const isGithubIo = hostname.endsWith("github.io");
 
-  // User/Org Pages:
-  // - repo is <owner>.github.io
-  // - URL looks like https://<owner>.github.io/admin.html (no repo segment)
-  //
-  // Project Pages:
-  // - repo is first path segment
-  // - URL looks like https://<owner>.github.io/<repo>/admin.html
   const looksLikeProjectPages =
     isGithubIo &&
     pathParts.length > 0 &&
-    // first segment is NOT a file-like thing (admin.html) and not assets-like
     !pathParts[0].includes(".") &&
-    // and it's not a known top-level dir you might use on user pages
     !["assets", "videos"].includes(pathParts[0]);
 
   const repo = looksLikeProjectPages ? pathParts[0] : `${owner}.github.io`;
@@ -59,7 +50,10 @@ export async function ghFetch(url, { token, method = "GET", headers = {}, body }
   const h = new Headers(headers);
   h.set("Accept", "application/vnd.github+json");
   h.set("X-GitHub-Api-Version", "2022-11-28");
-  if (token) h.set("Authorization", `token ${token}`);
+
+  // IMPORTANT: Use Bearer. Fine-grained PATs expect this format.
+  // (Also works for classic PATs.)
+  if (token) h.set("Authorization", `Bearer ${String(token).trim()}`);
 
   const res = await fetch(url, { method, headers: h, body });
   const text = await res.text();
