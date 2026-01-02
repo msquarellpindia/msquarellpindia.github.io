@@ -43,8 +43,8 @@ els.token.value = token;
 let videosJsonSha = null;           // sha for videos.json
 let playlist = [];                  // array of URLs (Pattern B)
 let release = null;                 // release object
-let assetsByName = new Map();       // name -> { id, size, url, content_type, download_count }
-let assetsByUrl = new Map();        // browser_download_url -> { name, id, ... }
+let assetsByName = new Map();       // name -> meta
+let assetsByUrl = new Map();        // stable url -> meta
 
 function setStatus(text, cls) {
   els.authStatus.textContent = text;
@@ -65,7 +65,6 @@ function api(path) {
   return `https://api.github.com${path}`;
 }
 function uploads(path) {
-  // Release asset uploads use uploads.github.com
   return `https://uploads.github.com${path}`;
 }
 
@@ -101,7 +100,7 @@ function setActionsPanel({
   }
 }
 
-/** ---------- GitHub Actions polling (triggered mainly by videos.json updates) ---------- **/
+/** ---------- GitHub Actions polling ---------- **/
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -230,32 +229,24 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
 /** ---------- Filename normalization ---------- **/
 
 function normalizeFileName(originalName) {
-  // Use your existing sanitize, then apply stronger normalization for stability
   const raw = sanitizeFileName(originalName || "video") || "video";
 
-  // Separate extension
   const dot = raw.lastIndexOf(".");
   let base = dot >= 0 ? raw.slice(0, dot) : raw;
   let ext = dot >= 0 ? raw.slice(dot) : "";
 
-  // Lowercase, collapse underscores, trim
   base = base.toLowerCase().replace(/_+/g, "_").replace(/^_+|_+$/g, "");
   ext = ext.toLowerCase();
 
-  // Avoid empty basename
   if (!base) base = "video";
 
-  // Avoid weird trailing dots
   const out = `${base}${ext}`.replace(/\.+$/g, "");
-
-  // Keep it short-ish
   return out.slice(0, 180);
 }
 
 /** ---------- Release helpers ---------- **/
 
 function stableDownloadUrl(assetName) {
-  // Pattern B stable URL (no API needed in player)
   return `https://github.com/${owner}/${repo}/releases/download/${RELEASE_TAG}/${encodeURIComponent(assetName)}`;
 }
 
@@ -270,7 +261,7 @@ async function ensureRelease() {
     if (e.status !== 404) throw e;
   }
 
-  // Create release
+  // Create release (FIX: make_latest must be a string)
   release = await ghFetch(api(`/repos/${owner}/${repo}/releases`), {
     token,
     method: "POST",
@@ -281,7 +272,7 @@ async function ensureRelease() {
       body: "Assets for signboard playback (managed by admin UI).",
       draft: false,
       prerelease: false,
-      make_latest: false
+      make_latest: "false"
     })
   });
 
@@ -292,7 +283,6 @@ async function loadReleaseAssets() {
   requireToken();
   await ensureRelease();
 
-  // List assets
   const arr = await ghFetch(api(`/repos/${owner}/${repo}/releases/${release.id}/assets?per_page=100`), { token });
   assetsByName.clear();
   assetsByUrl.clear();
@@ -308,7 +298,10 @@ async function loadReleaseAssets() {
         download_count: a.download_count,
       };
       assetsByName.set(a.name, meta);
-      assetsByUrl.set(a.browser_download_url, meta);
+
+      // We store stable URLs in videos.json, so map stable URL -> meta
+      const stable = stableDownloadUrl(a.name);
+      assetsByUrl.set(stable, meta);
     }
   }
 }
@@ -456,10 +449,8 @@ function renderList() {
           await deleteReleaseAsset(a.id);
         }
 
-        // Remove from playlist
         playlist = playlist.filter(x => x !== url);
 
-        // Refresh assets and save playlist
         await loadReleaseAssets();
         const commitSha = await saveVideosJson();
         renderList();
@@ -534,12 +525,11 @@ async function refreshAll() {
     await loadReleaseAssets();
     await loadPlaylist();
 
-    // Reconcile:
-    // - drop playlist URLs that don't correspond to existing assets (optional)
+    // Reconcile: keep only entries that match current assets
     playlist = playlist.filter(u => assetsByUrl.has(u));
 
-    // - append assets not in playlist (optional)
-    for (const [name, meta] of assetsByName.entries()) {
+    // Append any assets not in playlist
+    for (const [name] of assetsByName.entries()) {
       const stable = stableDownloadUrl(name);
       if (!playlist.includes(stable)) playlist.push(stable);
     }
@@ -568,11 +558,9 @@ async function uploadOneFile(file) {
   requireToken();
   await ensureRelease();
 
-  // Normalize filename
   const normalized = normalizeFileName(file.name);
   let name = normalized;
 
-  // Avoid collisions: if asset with same name exists, add suffix
   if (assetsByName.has(name)) {
     const dot = name.lastIndexOf(".");
     const base = dot >= 0 ? name.slice(0, dot) : name;
@@ -587,17 +575,14 @@ async function uploadOneFile(file) {
   els.prog.value = 0;
   els.uploadMsg.textContent = `Uploading asset: ${name}`;
 
-  // Upload binary to release assets (XHR progress)
-  const asset = await uploadReleaseAssetXhr({
+  await uploadReleaseAssetXhr({
     releaseId: release.id,
     name,
     file
   });
 
-  // Update local maps
   await loadReleaseAssets();
 
-  // Add stable URL to playlist if not present
   const stable = stableDownloadUrl(name);
   if (!playlist.includes(stable)) playlist.push(stable);
 
@@ -674,7 +659,6 @@ els.upload.addEventListener("click", async () => {
       await uploadOneFile(f);
     }
 
-    // Persist playlist URLs
     setMessage("Updating videos.json…", "muted");
     const commitSha = await saveVideosJson();
 
