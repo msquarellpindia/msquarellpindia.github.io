@@ -1,29 +1,47 @@
 export function getBasePath() {
-  // For project pages: https://user.github.io/repo/...
-  // For user/org pages: https://user.github.io/...
   const { hostname, pathname } = window.location;
-  if (!hostname.endsWith("github.io")) return "/"; // best effort for custom domains too
+
+  // For custom domains, just assume root.
+  if (!hostname.endsWith("github.io")) return "/";
+
   const parts = pathname.split("/").filter(Boolean);
-  // If first segment is repo (project pages), base path is /repo/
-  // If no segment, base path is /
-  return parts.length >= 1 ? `/${parts[0]}/` : "/";
+
+  // If first segment looks like a file (admin.html, index.html, etc), base is root.
+  if (parts.length === 0) return "/";
+  if (parts[0].includes(".")) return "/";
+
+  // Otherwise, this is project pages, base is /<repo>/
+  return `/${parts[0]}/`;
 }
 
 export function inferOwnerRepo() {
-  // Handles:
-  // - Project Pages: owner from subdomain, repo from first path segment
-  // - User Pages: repo = <owner>.github.io, path has no repo segment
   const { hostname, pathname } = window.location;
+
+  // Expected GitHub Pages host: <owner>.github.io
   const hostParts = hostname.split(".");
-  const owner = hostParts[0]; // <owner>.github.io
+  const owner = hostParts[0];
+
   const pathParts = pathname.split("/").filter(Boolean);
 
-  let repo;
-  if (pathParts.length === 0) {
-    repo = `${owner}.github.io`; // user/org pages repository naming convention
-  } else {
-    repo = pathParts[0]; // project pages repo
-  }
+  const isGithubIo = hostname.endsWith("github.io");
+
+  // User/Org Pages:
+  // - repo is <owner>.github.io
+  // - URL looks like https://<owner>.github.io/admin.html (no repo segment)
+  //
+  // Project Pages:
+  // - repo is first path segment
+  // - URL looks like https://<owner>.github.io/<repo>/admin.html
+  const looksLikeProjectPages =
+    isGithubIo &&
+    pathParts.length > 0 &&
+    // first segment is NOT a file-like thing (admin.html) and not assets-like
+    !pathParts[0].includes(".") &&
+    // and it's not a known top-level file/dir you might use on user pages
+    !["assets", "videos"].includes(pathParts[0]);
+
+  const repo = looksLikeProjectPages ? pathParts[0] : `${owner}.github.io`;
+
   return { owner, repo };
 }
 
