@@ -43,19 +43,22 @@
     .actions-pill.warn { background: rgba(176,0,32,.12); color: #b00020; }
     .actions-pill.muted { background: rgba(0,0,0,.06); color: #555; }
     .actions-link { text-decoration: underline; cursor: pointer; }
+    code { background: rgba(0,0,0,.04); padding: 1px 5px; border-radius: 6px; }
   </style>
 </head>
 <body>
   <h1>Playlist Admin</h1>
+
   <div class="row muted">
     This page uses your GitHub PAT in <code>localStorage</code> and talks directly to the GitHub API.
+    Videos are stored as <strong>GitHub Release assets</strong> (binary-friendly).
   </div>
 
   <div class="box">
     <div class="row">
       <label>
         PAT:
-        <input id="token" type="password" placeholder="ghp_..." autocomplete="off" />
+        <input id="token" type="password" placeholder="github_pat_..." autocomplete="off" />
       </label>
       <button id="saveToken">Save</button>
       <button id="clearToken">Clear</button>
@@ -68,9 +71,14 @@
       <span id="repoInfo" class="muted"></span>
     </div>
 
+    <div class="row muted" style="margin-top: 0;">
+      Storage: Release tag <code>signboard-assets</code><br/>
+      Playlist file: <code>videos.json</code> (stores stable download URLs)
+    </div>
+
     <div class="row">
       <label>
-        Upload video(s):
+        Upload video(s) as Release assets:
         <input id="fileInput" type="file" accept="video/*" multiple />
       </label>
       <button id="upload">Upload</button>
@@ -84,7 +92,7 @@
     <div class="box" style="margin-top: 12px;">
       <div class="row" style="margin: 0 0 6px;">
         <strong>Actions Status</strong>
-        <span class="muted">— latest workflow run triggered by your changes</span>
+        <span class="muted">— workflow run triggered by changes (typically videos.json)</span>
       </div>
 
       <div class="actions-grid">
@@ -115,7 +123,7 @@
   <div class="box" style="margin-top: 14px;">
     <div class="row">
       <strong>Playlist (drag to reorder)</strong>
-      <span class="muted">— stored in <code>videos.json</code></span>
+      <span class="muted">— saved to <code>videos.json</code> (stable Release asset URLs)</span>
     </div>
     <ul id="list"></ul>
 

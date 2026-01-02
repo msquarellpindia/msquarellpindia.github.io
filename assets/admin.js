@@ -2,11 +2,12 @@ import {
   inferOwnerRepo,
   lsGet, lsSet, lsDel,
   ghFetch,
-  b64encodeArrayBuffer,
   sanitizeFileName
 } from "./common.js";
 
 const TOKEN_KEY = "gh_pat";
+const RELEASE_TAG = "signboard-assets"; // Pattern B fixed tag
+const RELEASE_NAME = "Signboard Assets"; // shown in GitHub UI if we create it
 
 const els = {
   token: document.getElementById("token"),
@@ -39,10 +40,11 @@ els.repoInfo.textContent = `Repo inferred: ${owner}/${repo}`;
 let token = lsGet(TOKEN_KEY) || "";
 els.token.value = token;
 
-let defaultBranch = "main";       // fetched from repo metadata
-let videosJsonSha = null;         // sha for videos.json (needed for updates)
-let videosFolderMap = new Map();  // filename -> { sha, path }
-let playlist = [];                // ordered list of filenames
+let videosJsonSha = null;           // sha for videos.json
+let playlist = [];                  // array of URLs (Pattern B)
+let release = null;                 // release object
+let assetsByName = new Map();       // name -> { id, size, url, content_type, download_count }
+let assetsByUrl = new Map();        // browser_download_url -> { name, id, ... }
 
 function setStatus(text, cls) {
   els.authStatus.textContent = text;
@@ -62,6 +64,10 @@ function requireToken() {
 function api(path) {
   return `https://api.github.com${path}`;
 }
+function uploads(path) {
+  // Release asset uploads use uploads.github.com
+  return `https://uploads.github.com${path}`;
+}
 
 /** ---------- Actions Status panel helpers ---------- **/
 
@@ -70,7 +76,7 @@ function nowLocalString() {
 }
 function setActionsPanel({
   stateText = "Idle",
-  stateKind = "muted", // "muted" | "ok" | "warn"
+  stateKind = "muted",
   commit = "—",
   workflow = "—",
   runText = "—",
@@ -95,7 +101,7 @@ function setActionsPanel({
   }
 }
 
-/** ---------- GitHub Actions polling ---------- **/
+/** ---------- GitHub Actions polling (triggered mainly by videos.json updates) ---------- **/
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -119,7 +125,7 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
       workflow: "—",
       runText: "—",
       runUrl: null,
-      notes: "No commit SHA returned by API.",
+      notes: "No commit SHA to poll.",
     });
     return;
   }
@@ -134,12 +140,11 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
     workflow: "Searching…",
     runText: "Waiting for run to appear…",
     runUrl: null,
-    notes: "If Actions is disabled or your token lacks Actions: Read, polling will fail gracefully.",
+    notes: "If token lacks Actions: Read, polling may show Unavailable.",
   });
 
-  let run = null;
-
   while (Date.now() - start < timeoutMs) {
+    let run = null;
     try {
       run = await findRunForCommit(commitSha);
     } catch (e) {
@@ -195,7 +200,7 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
         workflow: String(wfName),
         runText: pretty,
         runUrl: url,
-        notes: "Deployment/build succeeded.",
+        notes: "Workflow succeeded.",
       });
     } else {
       setActionsPanel({
@@ -205,7 +210,7 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
         workflow: String(wfName),
         runText: pretty,
         runUrl: url,
-        notes: "Workflow finished but not successful — open the run for logs.",
+        notes: "Workflow not successful — open the run for logs.",
       });
     }
     return;
@@ -218,121 +223,97 @@ async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs 
     workflow: "—",
     runText: "—",
     runUrl: null,
-    notes: "Timed out waiting for a workflow run. You can check Actions manually.",
+    notes: "Timed out waiting for workflow run.",
   });
 }
 
-/** ---------- Git Database API (used directly for uploads) ---------- **/
+/** ---------- Filename normalization ---------- **/
 
-async function getHeadCommitSha(branch) {
-  const ref = await ghFetch(api(`/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`), { token });
-  return ref?.object?.sha;
-}
-async function getCommit(commitSha) {
-  return ghFetch(api(`/repos/${owner}/${repo}/git/commits/${commitSha}`), { token });
-}
-async function createBlobBase64(b64) {
-  return ghFetch(api(`/repos/${owner}/${repo}/git/blobs`), {
-    token,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content: b64, encoding: "base64" })
-  });
-}
-async function createTreeWithFile({ baseTreeSha, path, blobSha }) {
-  return ghFetch(api(`/repos/${owner}/${repo}/git/trees`), {
-    token,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      base_tree: baseTreeSha,
-      tree: [{
-        path,
-        mode: "100644",
-        type: "blob",
-        sha: blobSha
-      }]
-    })
-  });
-}
-async function createCommit({ message, treeSha, parentSha }) {
-  return ghFetch(api(`/repos/${owner}/${repo}/git/commits`), {
-    token,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message,
-      tree: treeSha,
-      parents: [parentSha]
-    })
-  });
-}
-async function updateBranchRef({ branch, newCommitSha }) {
-  return ghFetch(api(`/repos/${owner}/${repo}/git/refs/heads/${encodeURIComponent(branch)}`), {
-    token,
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sha: newCommitSha, force: false })
-  });
+function normalizeFileName(originalName) {
+  // Use your existing sanitize, then apply stronger normalization for stability
+  const raw = sanitizeFileName(originalName || "video") || "video";
+
+  // Separate extension
+  const dot = raw.lastIndexOf(".");
+  let base = dot >= 0 ? raw.slice(0, dot) : raw;
+  let ext = dot >= 0 ? raw.slice(dot) : "";
+
+  // Lowercase, collapse underscores, trim
+  base = base.toLowerCase().replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  ext = ext.toLowerCase();
+
+  // Avoid empty basename
+  if (!base) base = "video";
+
+  // Avoid weird trailing dots
+  const out = `${base}${ext}`.replace(/\.+$/g, "");
+
+  // Keep it short-ish
+  return out.slice(0, 180);
 }
 
-/**
- * Upload/create/overwrite a single file via Git Data API.
- * Shows stage-style progress (not true network upload progress).
- */
-async function uploadViaGitData({ repoPath, base64Content, message, onStage }) {
+/** ---------- Release helpers ---------- **/
+
+function stableDownloadUrl(assetName) {
+  // Pattern B stable URL (no API needed in player)
+  return `https://github.com/${owner}/${repo}/releases/download/${RELEASE_TAG}/${encodeURIComponent(assetName)}`;
+}
+
+async function ensureRelease() {
   requireToken();
 
-  const stage = (pct, text) => {
-    if (typeof onStage === "function") onStage(pct, text);
-  };
+  // Try get by tag
+  try {
+    release = await ghFetch(api(`/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(RELEASE_TAG)}`), { token });
+    return release;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+  }
 
-  stage(5, "Resolving branch head…");
-  const headSha = await getHeadCommitSha(defaultBranch);
-  if (!headSha) throw new Error(`Could not resolve head for branch ${defaultBranch}`);
+  // Create release
+  release = await ghFetch(api(`/repos/${owner}/${repo}/releases`), {
+    token,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      tag_name: RELEASE_TAG,
+      name: RELEASE_NAME,
+      body: "Assets for signboard playback (managed by admin UI).",
+      draft: false,
+      prerelease: false,
+      make_latest: false
+    })
+  });
 
-  stage(15, "Reading head commit…");
-  const headCommit = await getCommit(headSha);
-  const baseTreeSha = headCommit?.tree?.sha;
-  if (!baseTreeSha) throw new Error("Could not resolve base tree");
-
-  stage(40, "Creating blob…");
-  const blob = await createBlobBase64(base64Content);
-  const blobSha = blob?.sha;
-  if (!blobSha) throw new Error("Failed to create blob");
-
-  stage(65, "Creating tree…");
-  const tree = await createTreeWithFile({ baseTreeSha, path: repoPath, blobSha });
-  const treeSha = tree?.sha;
-  if (!treeSha) throw new Error("Failed to create tree");
-
-  stage(82, "Creating commit…");
-  const commit = await createCommit({ message, treeSha, parentSha: headSha });
-  const newCommitSha = commit?.sha;
-  if (!newCommitSha) throw new Error("Failed to create commit");
-
-  stage(95, "Updating branch ref…");
-  await updateBranchRef({ branch: defaultBranch, newCommitSha });
-
-  stage(100, "Done");
-  return newCommitSha;
+  return release;
 }
 
-/** ---------- Auth & repo ---------- **/
+async function loadReleaseAssets() {
+  requireToken();
+  await ensureRelease();
 
-async function validateToken() {
-  if (!token) { setStatus("Not connected"); return false; }
-  try {
-    const meta = await ghFetch(api(`/repos/${owner}/${repo}`), { token });
-    defaultBranch = meta?.default_branch || defaultBranch;
-    setStatus("Connected", "ok");
-    return true;
-  } catch (e) {
-    setStatus("Token invalid / no access", "warn");
-    setMessage(`Auth error: ${e.message}`, "warn");
-    return false;
+  // List assets
+  const arr = await ghFetch(api(`/repos/${owner}/${repo}/releases/${release.id}/assets?per_page=100`), { token });
+  assetsByName.clear();
+  assetsByUrl.clear();
+
+  if (Array.isArray(arr)) {
+    for (const a of arr) {
+      const meta = {
+        id: a.id,
+        name: a.name,
+        size: a.size,
+        browser_download_url: a.browser_download_url,
+        content_type: a.content_type,
+        download_count: a.download_count,
+      };
+      assetsByName.set(a.name, meta);
+      assetsByUrl.set(a.browser_download_url, meta);
+    }
   }
 }
+
+/** ---------- videos.json read/write ---------- **/
 
 async function getFileContent(path) {
   requireToken();
@@ -342,35 +323,14 @@ async function getFileContent(path) {
   return { sha: j.sha, content };
 }
 
-async function listVideosFolder() {
-  requireToken();
-  videosFolderMap.clear();
-  let items = [];
-  try {
-    items = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos`), { token });
-  } catch (e) {
-    if (e.status === 404) return;
-    throw e;
-  }
-
-  if (!Array.isArray(items)) return;
-  for (const it of items) {
-    if (it.type === "file") {
-      videosFolderMap.set(it.name, { sha: it.sha, path: it.path });
-    }
-  }
-}
-
-async function loadPlaylistAndShas() {
-  setMessage("");
+async function loadPlaylist() {
   requireToken();
 
   try {
     const { sha, content } = await getFileContent("videos.json");
     videosJsonSha = sha;
-    playlist = JSON.parse(content);
-    if (!Array.isArray(playlist)) playlist = [];
-    playlist = playlist.filter(v => typeof v === "string" && v.trim().length > 0);
+    const data = JSON.parse(content);
+    playlist = Array.isArray(data) ? data.filter(x => typeof x === "string" && x.trim()) : [];
   } catch (e) {
     if (String(e.message).includes("404")) {
       playlist = [];
@@ -379,14 +339,81 @@ async function loadPlaylistAndShas() {
       throw e;
     }
   }
-
-  await listVideosFolder();
-
-  playlist = playlist.filter(name => videosFolderMap.has(name));
-  for (const name of videosFolderMap.keys()) {
-    if (!playlist.includes(name)) playlist.push(name);
-  }
 }
+
+async function saveVideosJson() {
+  requireToken();
+  const bodyText = JSON.stringify(playlist, null, 2) + "\n";
+
+  const payload = {
+    message: "Update videos.json playlist order",
+    content: btoa(unescape(encodeURIComponent(bodyText))),
+    ...(videosJsonSha ? { sha: videosJsonSha } : {}),
+  };
+
+  const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos.json`), {
+    token,
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  videosJsonSha = j?.content?.sha || videosJsonSha;
+  return j?.commit?.sha || null;
+}
+
+/** ---------- Upload release asset with XHR + progress ---------- **/
+
+function uploadReleaseAssetXhr({ releaseId, name, file }) {
+  return new Promise((resolve, reject) => {
+    const url = uploads(`/repos/${owner}/${repo}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+
+    xhr.setRequestHeader("Accept", "application/vnd.github+json");
+    xhr.setRequestHeader("X-GitHub-Api-Version", "2022-11-28");
+    xhr.setRequestHeader("Authorization", `Bearer ${String(token).trim()}`);
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        els.prog.value = pct;
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Network error while uploading asset"));
+    xhr.onload = () => {
+      const status = xhr.status;
+      const text = xhr.responseText || "";
+      let json = null;
+      try { json = text ? JSON.parse(text) : null; } catch {}
+
+      if (status >= 200 && status < 300) {
+        resolve(json);
+      } else {
+        const msg = json?.message || text || `HTTP ${status}`;
+        const err = new Error(msg);
+        err.status = status;
+        err.details = json;
+        reject(err);
+      }
+    };
+
+    xhr.send(file);
+  });
+}
+
+async function deleteReleaseAsset(assetId) {
+  requireToken();
+  await ghFetch(api(`/repos/${owner}/${repo}/releases/assets/${assetId}`), {
+    token,
+    method: "DELETE",
+  });
+}
+
+/** ---------- UI rendering ---------- **/
 
 function renderList() {
   els.list.innerHTML = "";
@@ -398,7 +425,7 @@ function renderList() {
     return;
   }
 
-  playlist.forEach((name, i) => {
+  playlist.forEach((url, i) => {
     const li = document.createElement("li");
     li.draggable = true;
     li.dataset.index = String(i);
@@ -409,30 +436,36 @@ function renderList() {
 
     const nm = document.createElement("span");
     nm.className = "name";
-    nm.textContent = name;
+    nm.textContent = url;
 
+    const asset = assetsByUrl.get(url);
     const exists = document.createElement("span");
     exists.className = "pill";
-    exists.textContent = videosFolderMap.has(name) ? "in /videos" : "missing";
-    if (!videosFolderMap.has(name)) exists.classList.add("warn");
+    exists.textContent = asset ? `asset (${Math.round(asset.size / 1024 / 1024)} MB)` : "missing";
+    if (!asset) exists.classList.add("warn");
 
     const del = document.createElement("button");
     del.textContent = "Delete";
     del.addEventListener("click", async () => {
       try {
-        setMessage(`Deleting ${name}…`, "muted");
-        setActionsPanel({ notes: "Waiting for change to be saved…" });
+        setMessage("Deleting…", "muted");
+        setActionsPanel({ notes: "Deleting asset + updating videos.json…" });
 
-        const commitSha = await deleteVideo(name);
-        playlist = playlist.filter(v => v !== name);
+        const a = assetsByUrl.get(url);
+        if (a?.id) {
+          await deleteReleaseAsset(a.id);
+        }
 
-        setMessage(`Updating videos.json…`, "muted");
-        const jsonCommit = await saveVideosJson();
+        // Remove from playlist
+        playlist = playlist.filter(x => x !== url);
 
+        // Refresh assets and save playlist
+        await loadReleaseAssets();
+        const commitSha = await saveVideosJson();
         renderList();
-        setMessage(`Deleted ${name}.`, "ok");
 
-        await pollActionsForCommit(jsonCommit || commitSha);
+        setMessage("Deleted and updated videos.json.", "ok");
+        await pollActionsForCommit(commitSha);
       } catch (e) {
         setMessage(`Delete failed: ${e.message}`, "warn");
         setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
@@ -457,9 +490,7 @@ function wireDragAndDrop() {
       e.dataTransfer.effectAllowed = "move";
     });
 
-    li.addEventListener("dragend", () => {
-      li.classList.remove("dragging");
-    });
+    li.addEventListener("dragend", () => li.classList.remove("dragging"));
 
     li.addEventListener("dragover", (e) => {
       e.preventDefault();
@@ -478,105 +509,20 @@ function wireDragAndDrop() {
   });
 }
 
-/** ---------- videos.json write (returns commit sha) ---------- **/
+/** ---------- Auth / refresh ---------- **/
 
-async function saveVideosJson() {
-  requireToken();
-  const bodyText = JSON.stringify(playlist, null, 2) + "\n";
-
-  const payload = {
-    message: "Update videos.json playlist order",
-    content: btoa(unescape(encodeURIComponent(bodyText))),
-    ...(videosJsonSha ? { sha: videosJsonSha } : {}),
-  };
-
-  const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos.json`), {
-    token,
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  videosJsonSha = j?.content?.sha || videosJsonSha;
-  return j?.commit?.sha || null;
-}
-
-/** ---------- Upload & delete ---------- **/
-
-async function uploadOneFile(file) {
-  requireToken();
-
-  const original = file.name || "video";
-  const safe = sanitizeFileName(original) || "video.mp4";
-
-  let name = safe;
-  if (videosFolderMap.has(name)) {
-    const dot = safe.lastIndexOf(".");
-    const base = dot >= 0 ? safe.slice(0, dot) : safe;
-    const ext = dot >= 0 ? safe.slice(dot) : "";
-    let n = 2;
-    while (videosFolderMap.has(`${base}_${n}${ext}`)) n++;
-    name = `${base}_${n}${ext}`;
+async function validateToken() {
+  if (!token) { setStatus("Not connected"); return false; }
+  try {
+    await ghFetch(api(`/repos/${owner}/${repo}`), { token });
+    setStatus("Connected", "ok");
+    return true;
+  } catch (e) {
+    setStatus("Token invalid / no access", "warn");
+    setMessage(`Auth error: ${e.message}`, "warn");
+    return false;
   }
-
-  // Phase 1: encoding progress (deterministic)
-  els.prog.style.display = "";
-  els.prog.max = 100;
-  els.prog.value = 0;
-  els.uploadMsg.textContent = `Encoding: ${file.name}`;
-
-  const buf = await file.arrayBuffer();
-  const b64 = b64encodeArrayBuffer(buf, (pct) => {
-    els.prog.value = pct;
-  });
-
-  // Phase 2: Git Data stages
-  els.prog.value = 0;
-  els.uploadMsg.textContent = `Uploading (Git Data API): ${name}`;
-
-  const commitSha = await uploadViaGitData({
-    repoPath: `videos/${name}`,
-    base64Content: b64,
-    message: `Upload video ${name}`,
-    onStage: (pct, text) => {
-      els.prog.value = pct;
-      els.uploadMsg.textContent = `${text}`;
-    }
-  });
-
-  // Refresh folder map so delete works later
-  await listVideosFolder();
-  if (!playlist.includes(name)) playlist.push(name);
-
-  return commitSha;
 }
-
-async function deleteVideo(name) {
-  requireToken();
-  const meta = videosFolderMap.get(name);
-  if (!meta?.sha) {
-    await listVideosFolder();
-  }
-  const meta2 = videosFolderMap.get(name);
-  if (!meta2?.sha) throw new Error("Cannot find file sha to delete (refresh and try again)");
-
-  const payload = {
-    message: `Delete video ${name}`,
-    sha: meta2.sha,
-  };
-
-  const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos/${encodeURIComponent(name)}`), {
-    token,
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  videosFolderMap.delete(name);
-  return j?.commit?.sha || null;
-}
-
-/** ---------- Refresh ---------- **/
 
 async function refreshAll() {
   setMessage("");
@@ -584,9 +530,22 @@ async function refreshAll() {
   if (!ok) return;
 
   try {
-    await loadPlaylistAndShas();
+    await ensureRelease();
+    await loadReleaseAssets();
+    await loadPlaylist();
+
+    // Reconcile:
+    // - drop playlist URLs that don't correspond to existing assets (optional)
+    playlist = playlist.filter(u => assetsByUrl.has(u));
+
+    // - append assets not in playlist (optional)
+    for (const [name, meta] of assetsByName.entries()) {
+      const stable = stableDownloadUrl(name);
+      if (!playlist.includes(stable)) playlist.push(stable);
+    }
+
     renderList();
-    setMessage("Loaded videos and playlist.", "ok");
+    setMessage(`Loaded release assets + playlist (${RELEASE_TAG}).`, "ok");
 
     setActionsPanel({
       stateText: "Idle",
@@ -599,7 +558,50 @@ async function refreshAll() {
     });
   } catch (e) {
     setMessage(`Refresh failed: ${e.message}`, "warn");
+    setActionsPanel({ stateText: "Error", stateKind: "warn", notes: e.message });
   }
+}
+
+/** ---------- Upload flow ---------- **/
+
+async function uploadOneFile(file) {
+  requireToken();
+  await ensureRelease();
+
+  // Normalize filename
+  const normalized = normalizeFileName(file.name);
+  let name = normalized;
+
+  // Avoid collisions: if asset with same name exists, add suffix
+  if (assetsByName.has(name)) {
+    const dot = name.lastIndexOf(".");
+    const base = dot >= 0 ? name.slice(0, dot) : name;
+    const ext = dot >= 0 ? name.slice(dot) : "";
+    let n = 2;
+    while (assetsByName.has(`${base}_${n}${ext}`)) n++;
+    name = `${base}_${n}${ext}`;
+  }
+
+  els.prog.style.display = "";
+  els.prog.max = 100;
+  els.prog.value = 0;
+  els.uploadMsg.textContent = `Uploading asset: ${name}`;
+
+  // Upload binary to release assets (XHR progress)
+  const asset = await uploadReleaseAssetXhr({
+    releaseId: release.id,
+    name,
+    file
+  });
+
+  // Update local maps
+  await loadReleaseAssets();
+
+  // Add stable URL to playlist if not present
+  const stable = stableDownloadUrl(name);
+  if (!playlist.includes(stable)) playlist.push(stable);
+
+  return stable;
 }
 
 /** ---------- UI wiring ---------- **/
@@ -628,7 +630,7 @@ els.clearToken.addEventListener("click", () => {
     workflow: "—",
     runText: "—",
     runUrl: null,
-    notes: "Token cleared; Actions polling disabled.",
+    notes: "Token cleared; operations disabled.",
   });
 });
 
@@ -642,7 +644,6 @@ els.saveOrder.addEventListener("click", async () => {
 
     const commitSha = await saveVideosJson();
     setMessage("Saved videos.json order.", "ok");
-
     await pollActionsForCommit(commitSha);
   } catch (e) {
     setMessage(`Save failed: ${e.message}`, "warn");
@@ -656,12 +657,7 @@ els.upload.addEventListener("click", async () => {
     const files = [...(els.fileInput.files || [])];
     if (!files.length) { setMessage("Choose one or more video files first.", "warn"); return; }
 
-    els.prog.style.display = "";
-    els.prog.max = 100;
-    els.prog.value = 0;
-    els.uploadMsg.textContent = "";
     setMessage("Starting upload…", "muted");
-
     setActionsPanel({
       stateText: "Idle",
       stateKind: "muted",
@@ -669,26 +665,24 @@ els.upload.addEventListener("click", async () => {
       workflow: "—",
       runText: "—",
       runUrl: null,
-      notes: "Uploading… workflow polling will start after commit is created.",
+      notes: "Uploading assets… videos.json update will trigger workflow polling.",
     });
-
-    let lastCommitSha = null;
 
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       setMessage(`Uploading ${i + 1}/${files.length}: ${f.name}`, "muted");
-      lastCommitSha = await uploadOneFile(f);
+      await uploadOneFile(f);
     }
 
+    // Persist playlist URLs
     setMessage("Updating videos.json…", "muted");
-    const jsonCommit = await saveVideosJson();
+    const commitSha = await saveVideosJson();
 
     renderList();
-
     els.uploadMsg.textContent = `Uploaded ${files.length} file(s) and updated videos.json.`;
     setMessage("Upload complete.", "ok");
 
-    await pollActionsForCommit(jsonCommit || lastCommitSha);
+    await pollActionsForCommit(commitSha);
 
   } catch (e) {
     setMessage(`Upload failed: ${e.message}`, "warn");
@@ -712,7 +706,7 @@ els.upload.addEventListener("click", async () => {
     workflow: "—",
     runText: "—",
     runUrl: null,
-    notes: "Waiting for an operation…",
+    notes: `Using release tag: ${RELEASE_TAG}`,
   });
 
   if (token) {

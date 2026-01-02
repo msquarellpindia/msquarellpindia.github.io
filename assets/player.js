@@ -3,7 +3,7 @@ import { getBasePath } from "./common.js";
 const videoEl = document.getElementById("player");
 const overlay = document.getElementById("overlay");
 
-const base = getBasePath(); // e.g. "/myrepo/" or "/"
+const base = getBasePath(); // for fallback support if videos.json still has filenames
 const videosJsonUrl = new URL(`${base}videos.json`, window.location.origin).toString();
 
 let playlist = [];
@@ -17,21 +17,37 @@ function hideOverlay() {
   overlay.classList.remove("visible");
 }
 
+function normalizeEntryToUrl(entry) {
+  // Pattern B: entry is already a URL
+  if (typeof entry === "string" && /^https?:\/\//i.test(entry.trim())) {
+    return entry.trim();
+  }
+
+  // Backward compatibility: entry is a filename in /videos/
+  if (typeof entry === "string" && entry.trim()) {
+    const filename = entry.trim();
+    return new URL(`${base}videos/${encodeURIComponent(filename)}`, window.location.origin).toString();
+  }
+
+  return null;
+}
+
 async function loadPlaylist() {
   const res = await fetch(videosJsonUrl, { cache: "no-store" });
   if (!res.ok) throw new Error(`Failed to load videos.json (${res.status})`);
   const data = await res.json();
-  if (!Array.isArray(data)) throw new Error("videos.json must be an array of filenames");
-  // Remove empty or non-string entries
-  return data.filter(v => typeof v === "string" && v.trim().length > 0);
+  if (!Array.isArray(data)) throw new Error("videos.json must be an array");
+
+  const urls = data
+    .map(normalizeEntryToUrl)
+    .filter(u => typeof u === "string" && u.length > 0);
+
+  return urls;
 }
 
-function setSource(filename) {
-  const url = new URL(`${base}videos/${encodeURIComponent(filename)}`, window.location.origin).toString();
+function setSource(url) {
   videoEl.src = url;
-  // Attempt play (autoplay policies can block if not muted)
   videoEl.play().catch(() => {
-    // If it fails, keep muted and retry
     videoEl.muted = true;
     videoEl.play().catch(() => {});
   });
@@ -61,11 +77,10 @@ async function start() {
 
 videoEl.addEventListener("ended", next);
 videoEl.addEventListener("error", () => {
-  // Skip broken entries after a short pause
   setTimeout(next, 700);
 });
 
-// Optional: reload playlist periodically (helps if admin updates while player runs)
+// Reload playlist periodically (helpful for signage)
 setInterval(async () => {
   try {
     const newList = await loadPlaylist();
