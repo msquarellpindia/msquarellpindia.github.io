@@ -37,7 +37,7 @@ export function inferOwnerRepo() {
     pathParts.length > 0 &&
     // first segment is NOT a file-like thing (admin.html) and not assets-like
     !pathParts[0].includes(".") &&
-    // and it's not a known top-level file/dir you might use on user pages
+    // and it's not a known top-level dir you might use on user pages
     !["assets", "videos"].includes(pathParts[0]);
 
   const repo = looksLikeProjectPages ? pathParts[0] : `${owner}.github.io`;
@@ -76,19 +76,34 @@ export async function ghFetch(url, { token, method = "GET", headers = {}, body }
   return json;
 }
 
-export function b64encodeArrayBuffer(buffer) {
-  // chunked base64 to avoid call stack issues
+/**
+ * Base64 encode an ArrayBuffer with optional progress callback.
+ * Progress is based on encoding work (not network upload).
+ * @param {ArrayBuffer} buffer
+ * @param {(pct:number)=>void} [onProgress]
+ */
+export function b64encodeArrayBuffer(buffer, onProgress) {
   const bytes = new Uint8Array(buffer);
   let binary = "";
   const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
+
+  const total = bytes.length;
+  if (onProgress) onProgress(0);
+
+  for (let i = 0; i < total; i += chunkSize) {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    if (onProgress) {
+      const pct = Math.min(99, Math.floor(((i + chunkSize) / total) * 100));
+      onProgress(pct);
+    }
   }
-  return btoa(binary);
+
+  const out = btoa(binary);
+  if (onProgress) onProgress(100);
+  return out;
 }
 
 export function sanitizeFileName(name) {
-  // Keep it conservative
   return name
     .replace(/\s+/g, "_")
     .replace(/[^a-zA-Z0-9._-]/g, "")

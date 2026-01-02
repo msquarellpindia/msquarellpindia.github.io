@@ -22,6 +22,15 @@ const els = {
   uploadMsg: document.getElementById("uploadMsg"),
   msg: document.getElementById("msg"),
   list: document.getElementById("list"),
+
+  // Actions Status UI
+  actionsState: document.getElementById("actionsState"),
+  actionsCommit: document.getElementById("actionsCommit"),
+  actionsWorkflow: document.getElementById("actionsWorkflow"),
+  actionsRun: document.getElementById("actionsRun"),
+  actionsRunLink: document.getElementById("actionsRunLink"),
+  actionsUpdated: document.getElementById("actionsUpdated"),
+  actionsNotes: document.getElementById("actionsNotes"),
 };
 
 const { owner, repo } = inferOwnerRepo();
@@ -30,9 +39,9 @@ els.repoInfo.textContent = `Repo inferred: ${owner}/${repo}`;
 let token = lsGet(TOKEN_KEY) || "";
 els.token.value = token;
 
-let videosJsonSha = null;      // sha for videos.json (needed for updates)
-let videosFolderMap = new Map(); // filename -> { sha, path }
-let playlist = [];             // ordered list of filenames
+let videosJsonSha = null;         // sha for videos.json (needed for updates)
+let videosFolderMap = new Map();  // filename -> { sha, path }
+let playlist = [];                // ordered list of filenames
 
 function setStatus(text, cls) {
   els.authStatus.textContent = text;
@@ -54,10 +63,175 @@ function api(path) {
   return `https://api.github.com${path}`;
 }
 
+/** ---------- Actions Status panel helpers ---------- **/
+
+function nowLocalString() {
+  return new Date().toLocaleString();
+}
+
+function setActionsPanel({
+  stateText = "Idle",
+  stateKind = "muted", // "muted" | "ok" | "warn"
+  commit = "—",
+  workflow = "—",
+  runText = "—",
+  runUrl = null,
+  notes = "—",
+} = {}) {
+  els.actionsState.textContent = stateText;
+  els.actionsState.className = `actions-pill ${stateKind}`.trim();
+
+  els.actionsCommit.textContent = commit;
+  els.actionsWorkflow.textContent = workflow;
+  els.actionsRun.textContent = runText;
+  els.actionsUpdated.textContent = nowLocalString();
+  els.actionsNotes.textContent = notes;
+
+  if (runUrl) {
+    els.actionsRunLink.style.display = "";
+    els.actionsRunLink.onclick = () => window.open(runUrl, "_blank", "noreferrer");
+  } else {
+    els.actionsRunLink.style.display = "none";
+    els.actionsRunLink.onclick = null;
+  }
+}
+
+/** ---------- GitHub Actions polling ---------- **/
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function formatRun(run) {
+  const s = run?.status || "unknown";
+  const c = run?.conclusion ? ` / ${run.conclusion}` : "";
+  return `${s}${c}`;
+}
+
+async function findRunForCommit(commitSha) {
+  const runs = await ghFetch(api(`/repos/${owner}/${repo}/actions/runs?per_page=20`), { token });
+  const arr = runs?.workflow_runs || [];
+  return arr.find(r => r.head_sha === commitSha) || null;
+}
+
+async function pollActionsForCommit(commitSha, { timeoutMs = 180000, intervalMs = 3000 } = {}) {
+  if (!commitSha) {
+    setActionsPanel({
+      stateText: "Idle",
+      stateKind: "muted",
+      commit: "—",
+      workflow: "—",
+      runText: "—",
+      runUrl: null,
+      notes: "No commit SHA returned by API.",
+    });
+    return;
+  }
+
+  const shortSha = commitSha.slice(0, 7);
+  const start = Date.now();
+
+  setActionsPanel({
+    stateText: "Polling…",
+    stateKind: "muted",
+    commit: shortSha,
+    workflow: "Searching…",
+    runText: "Waiting for run to appear…",
+    runUrl: null,
+    notes: "If Actions is disabled or your token lacks Actions: Read, polling will fail gracefully.",
+  });
+
+  let run = null;
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      run = await findRunForCommit(commitSha);
+    } catch (e) {
+      setActionsPanel({
+        stateText: "Unavailable",
+        stateKind: "warn",
+        commit: shortSha,
+        workflow: "—",
+        runText: "—",
+        runUrl: null,
+        notes: `Actions polling unavailable: ${e.message}`,
+      });
+      return;
+    }
+
+    if (!run) {
+      setActionsPanel({
+        stateText: "Polling…",
+        stateKind: "muted",
+        commit: shortSha,
+        workflow: "Searching…",
+        runText: "No run yet — retrying…",
+        runUrl: null,
+        notes: "GitHub may take a few seconds to register the workflow run.",
+      });
+      await sleep(intervalMs);
+      continue;
+    }
+
+    const pretty = formatRun(run);
+    const url = run?.html_url || null;
+    const wfName = run?.name || run?.workflow_id || "Workflow";
+
+    if (run.status !== "completed") {
+      setActionsPanel({
+        stateText: "Running",
+        stateKind: "muted",
+        commit: shortSha,
+        workflow: String(wfName),
+        runText: pretty,
+        runUrl: url,
+        notes: "Workflow still in progress…",
+      });
+      await sleep(intervalMs);
+      continue;
+    }
+
+    // Completed
+    if (run.conclusion === "success") {
+      setActionsPanel({
+        stateText: "Completed",
+        stateKind: "ok",
+        commit: shortSha,
+        workflow: String(wfName),
+        runText: pretty,
+        runUrl: url,
+        notes: "Deployment/build succeeded.",
+      });
+    } else {
+      setActionsPanel({
+        stateText: "Completed",
+        stateKind: "warn",
+        commit: shortSha,
+        workflow: String(wfName),
+        runText: pretty,
+        runUrl: url,
+        notes: "Workflow finished but not successful — open the run for logs.",
+      });
+    }
+    return;
+  }
+
+  setActionsPanel({
+    stateText: "Timed out",
+    stateKind: "warn",
+    commit: shortSha,
+    workflow: "—",
+    runText: "—",
+    runUrl: null,
+    notes: "Timed out waiting for a workflow run. You can check Actions manually.",
+  });
+}
+
+/** ---------- Auth & repo ---------- **/
+
 async function validateToken() {
   if (!token) { setStatus("Not connected"); return false; }
   try {
-    // Minimal check: fetch repo metadata (requires auth only if private)
     await ghFetch(api(`/repos/${owner}/${repo}`), { token });
     setStatus("Connected", "ok");
     return true;
@@ -71,47 +245,19 @@ async function validateToken() {
 async function getFileContent(path) {
   requireToken();
   const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`), { token });
-  // For files, API returns an object with base64 content
   if (!j || j.type !== "file") throw new Error(`Expected file at ${path}`);
   const content = atob((j.content || "").replace(/\n/g, ""));
   return { sha: j.sha, content };
 }
 
-async function putFileContent(path, contentText, message) {
-  requireToken();
-  // Need current sha if updating existing; we keep videosJsonSha for videos.json
-  let sha = null;
-  try {
-    const existing = await ghFetch(api(`/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`), { token });
-    if (existing?.sha) sha = existing.sha;
-  } catch {
-    // create new file
-  }
-
-  const body = {
-    message: message || `Update ${path}`,
-    content: btoa(unescape(encodeURIComponent(contentText))), // utf-8 safe-ish for JSON text
-    ...(sha ? { sha } : {}),
-  };
-
-  const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`), {
-    token,
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return j?.content?.sha || sha || null;
-}
-
 async function listVideosFolder() {
   requireToken();
   videosFolderMap.clear();
-  // If folder doesn't exist yet, API errors
   let items = [];
   try {
     items = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos`), { token });
   } catch (e) {
-    if (e.status === 404) return; // no folder yet
+    if (e.status === 404) return; // folder doesn't exist yet
     throw e;
   }
 
@@ -127,7 +273,6 @@ async function loadPlaylistAndShas() {
   setMessage("");
   requireToken();
 
-  // Load videos.json (if missing, start empty)
   try {
     const { sha, content } = await getFileContent("videos.json");
     videosJsonSha = sha;
@@ -143,13 +288,9 @@ async function loadPlaylistAndShas() {
     }
   }
 
-  // Load folder listing to know what exists / for deletions
   await listVideosFolder();
 
-  // Drop playlist entries that don't exist (optional but helpful)
   playlist = playlist.filter(name => videosFolderMap.has(name));
-
-  // Add any existing videos not in playlist (append at end)
   for (const name of videosFolderMap.keys()) {
     if (!playlist.includes(name)) playlist.push(name);
   }
@@ -187,13 +328,39 @@ function renderList() {
     del.textContent = "Delete";
     del.addEventListener("click", async () => {
       try {
-        await deleteVideo(name);
+        setMessage(`Deleting ${name}…`, "muted");
+        setActionsPanel({
+          stateText: "Idle",
+          stateKind: "muted",
+          commit: "—",
+          workflow: "—",
+          runText: "—",
+          runUrl: null,
+          notes: "Waiting for change to be saved…",
+        });
+
+        const commitSha = await deleteVideo(name);
+
         playlist = playlist.filter(v => v !== name);
-        await saveVideosJson();
+
+        setMessage(`Updating videos.json…`, "muted");
+        const jsonCommit = await saveVideosJson();
+
         renderList();
-        setMessage(`Deleted ${name} and updated videos.json`, "ok");
+        setMessage(`Deleted ${name}.`, "ok");
+
+        await pollActionsForCommit(jsonCommit || commitSha);
       } catch (e) {
         setMessage(`Delete failed: ${e.message}`, "warn");
+        setActionsPanel({
+          stateText: "Error",
+          stateKind: "warn",
+          commit: "—",
+          workflow: "—",
+          runText: "—",
+          runUrl: null,
+          notes: e.message,
+        });
       }
     });
 
@@ -206,7 +373,6 @@ function renderList() {
 
 function wireDragAndDrop() {
   const items = [...els.list.querySelectorAll("li")];
-
   let dragIndex = null;
 
   items.forEach(li => {
@@ -237,13 +403,15 @@ function wireDragAndDrop() {
   });
 }
 
+/** ---------- videos.json write (returns commit sha) ---------- **/
+
 async function saveVideosJson() {
   requireToken();
-  const body = JSON.stringify(playlist, null, 2) + "\n";
+  const bodyText = JSON.stringify(playlist, null, 2) + "\n";
 
   const payload = {
     message: "Update videos.json playlist order",
-    content: btoa(unescape(encodeURIComponent(body))),
+    content: btoa(unescape(encodeURIComponent(bodyText))),
     ...(videosJsonSha ? { sha: videosJsonSha } : {}),
   };
 
@@ -255,14 +423,17 @@ async function saveVideosJson() {
   });
 
   videosJsonSha = j?.content?.sha || videosJsonSha;
+  return j?.commit?.sha || null;
 }
+
+/** ---------- Upload & delete (return commit sha) ---------- **/
 
 async function uploadOneFile(file) {
   requireToken();
+
   const original = file.name || "video";
   const safe = sanitizeFileName(original) || "video.mp4";
 
-  // If name conflicts, add suffix
   let name = safe;
   if (videosFolderMap.has(name)) {
     const dot = safe.lastIndexOf(".");
@@ -273,8 +444,20 @@ async function uploadOneFile(file) {
     name = `${base}_${n}${ext}`;
   }
 
+  // Encoding progress
+  els.prog.style.display = "";
+  els.prog.value = 0;
+  els.prog.max = 100;
+  els.uploadMsg.textContent = `Encoding: ${file.name}`;
+
   const buf = await file.arrayBuffer();
-  const b64 = b64encodeArrayBuffer(buf);
+  const b64 = b64encodeArrayBuffer(buf, (pct) => {
+    els.prog.value = pct;
+  });
+
+  // Upload phase (indeterminate)
+  els.uploadMsg.textContent = `Uploading: ${name}`;
+  els.prog.removeAttribute("value");
 
   const payload = {
     message: `Upload video ${name}`,
@@ -288,16 +471,19 @@ async function uploadOneFile(file) {
     body: JSON.stringify(payload),
   });
 
-  // Update local map
+  // Back to determinate
+  els.prog.value = 100;
+
   videosFolderMap.set(name, { sha: j?.content?.sha, path: `videos/${name}` });
   if (!playlist.includes(name)) playlist.push(name);
+
+  return j?.commit?.sha || null;
 }
 
 async function deleteVideo(name) {
   requireToken();
   const meta = videosFolderMap.get(name);
   if (!meta?.sha) {
-    // refresh map if needed
     await listVideosFolder();
   }
   const meta2 = videosFolderMap.get(name);
@@ -308,7 +494,7 @@ async function deleteVideo(name) {
     sha: meta2.sha,
   };
 
-  await ghFetch(api(`/repos/${owner}/${repo}/contents/videos/${encodeURIComponent(name)}`), {
+  const j = await ghFetch(api(`/repos/${owner}/${repo}/contents/videos/${encodeURIComponent(name)}`), {
     token,
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
@@ -316,7 +502,10 @@ async function deleteVideo(name) {
   });
 
   videosFolderMap.delete(name);
+  return j?.commit?.sha || null;
 }
+
+/** ---------- Refresh ---------- **/
 
 async function refreshAll() {
   setMessage("");
@@ -327,12 +516,23 @@ async function refreshAll() {
     await loadPlaylistAndShas();
     renderList();
     setMessage("Loaded videos and playlist.", "ok");
+
+    setActionsPanel({
+      stateText: "Idle",
+      stateKind: "muted",
+      commit: "—",
+      workflow: "—",
+      runText: "—",
+      runUrl: null,
+      notes: "No recent operation.",
+    });
   } catch (e) {
     setMessage(`Refresh failed: ${e.message}`, "warn");
   }
 }
 
-// UI wiring
+/** ---------- UI wiring ---------- **/
+
 els.saveToken.addEventListener("click", async () => {
   token = (els.token.value || "").trim();
   if (!token) {
@@ -349,6 +549,16 @@ els.clearToken.addEventListener("click", () => {
   els.token.value = "";
   setStatus("Not connected");
   setMessage("Token cleared.", "muted");
+
+  setActionsPanel({
+    stateText: "Idle",
+    stateKind: "muted",
+    commit: "—",
+    workflow: "—",
+    runText: "—",
+    runUrl: null,
+    notes: "Token cleared; Actions polling disabled.",
+  });
 });
 
 els.refresh.addEventListener("click", refreshAll);
@@ -356,10 +566,32 @@ els.refresh.addEventListener("click", refreshAll);
 els.saveOrder.addEventListener("click", async () => {
   try {
     requireToken();
-    await saveVideosJson();
+    setMessage("Saving videos.json…", "muted");
+    setActionsPanel({
+      stateText: "Idle",
+      stateKind: "muted",
+      commit: "—",
+      workflow: "—",
+      runText: "—",
+      runUrl: null,
+      notes: "Saving…",
+    });
+
+    const commitSha = await saveVideosJson();
     setMessage("Saved videos.json order.", "ok");
+
+    await pollActionsForCommit(commitSha);
   } catch (e) {
     setMessage(`Save failed: ${e.message}`, "warn");
+    setActionsPanel({
+      stateText: "Error",
+      stateKind: "warn",
+      commit: "—",
+      workflow: "—",
+      runText: "—",
+      runUrl: null,
+      notes: e.message,
+    });
   }
 });
 
@@ -370,32 +602,70 @@ els.upload.addEventListener("click", async () => {
     if (!files.length) { setMessage("Choose one or more video files first.", "warn"); return; }
 
     els.prog.style.display = "";
-    els.prog.value = 0;
     els.uploadMsg.textContent = "";
+    setMessage("Starting upload…", "muted");
 
-    let done = 0;
-    for (const f of files) {
-      els.uploadMsg.textContent = `Uploading: ${f.name}`;
-      await uploadOneFile(f);
-      done++;
-      els.prog.value = Math.round((done / files.length) * 100);
+    setActionsPanel({
+      stateText: "Idle",
+      stateKind: "muted",
+      commit: "—",
+      workflow: "—",
+      runText: "—",
+      runUrl: null,
+      notes: "Uploading… workflow polling will start after commit is created.",
+    });
+
+    let lastCommitSha = null;
+
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      setMessage(`Uploading ${i + 1}/${files.length}: ${f.name}`, "muted");
+      lastCommitSha = await uploadOneFile(f);
     }
 
-    // Persist new playlist including uploads
-    await saveVideosJson();
+    setMessage("Updating videos.json…", "muted");
+    const jsonCommit = await saveVideosJson();
+
     renderList();
 
-    els.uploadMsg.textContent = `Uploaded ${done} file(s) and updated videos.json.`;
+    els.uploadMsg.textContent = `Uploaded ${files.length} file(s) and updated videos.json.`;
     setMessage("Upload complete.", "ok");
+
+    await pollActionsForCommit(jsonCommit || lastCommitSha);
+
   } catch (e) {
     setMessage(`Upload failed: ${e.message}`, "warn");
+    setActionsPanel({
+      stateText: "Error",
+      stateKind: "warn",
+      commit: "—",
+      workflow: "—",
+      runText: "—",
+      runUrl: null,
+      notes: e.message,
+    });
   } finally {
-    setTimeout(() => { els.prog.style.display = "none"; }, 700);
+    setTimeout(() => {
+      els.prog.style.display = "none";
+      els.uploadMsg.textContent = "";
+      els.prog.value = 0;
+      els.prog.max = 100;
+    }, 1200);
   }
 });
 
 // Initial
 (async () => {
+  setActionsPanel({
+    stateText: "Idle",
+    stateKind: "muted",
+    commit: "—",
+    workflow: "—",
+    runText: "—",
+    runUrl: null,
+    notes: "Waiting for an operation…",
+  });
+
   if (token) {
     await refreshAll();
   } else {

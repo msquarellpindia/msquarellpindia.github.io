@@ -27,6 +27,22 @@
     progress { width: 280px; height: 16px; }
     .footer { margin-top: 14px; }
     a { color: inherit; }
+
+    /* Actions Status panel */
+    .actions-grid {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 8px 12px;
+      margin-top: 8px;
+      align-items: center;
+    }
+    .actions-grid .label { color: #666; }
+    .actions-grid .value { word-break: break-word; }
+    .actions-pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: #eee; display: inline-block; }
+    .actions-pill.ok { background: rgba(10,122,10,.12); color: #0a7a0a; }
+    .actions-pill.warn { background: rgba(176,0,32,.12); color: #b00020; }
+    .actions-pill.muted { background: rgba(0,0,0,.06); color: #555; }
+    .actions-link { text-decoration: underline; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -63,6 +79,37 @@
     </div>
 
     <div id="msg" class="row"></div>
+
+    <!-- Dedicated Actions Status section -->
+    <div class="box" style="margin-top: 12px;">
+      <div class="row" style="margin: 0 0 6px;">
+        <strong>Actions Status</strong>
+        <span class="muted">— latest workflow run triggered by your changes</span>
+      </div>
+
+      <div class="actions-grid">
+        <div class="label">State</div>
+        <div class="value"><span id="actionsState" class="actions-pill muted">Idle</span></div>
+
+        <div class="label">Commit</div>
+        <div class="value"><span id="actionsCommit" class="muted">—</span></div>
+
+        <div class="label">Workflow</div>
+        <div class="value"><span id="actionsWorkflow" class="muted">—</span></div>
+
+        <div class="label">Run</div>
+        <div class="value">
+          <span id="actionsRun" class="muted">—</span>
+          <span id="actionsRunLink" class="actions-link muted" style="display:none; margin-left: 10px;">Open</span>
+        </div>
+
+        <div class="label">Last update</div>
+        <div class="value"><span id="actionsUpdated" class="muted">—</span></div>
+
+        <div class="label">Notes</div>
+        <div class="value"><span id="actionsNotes" class="muted">—</span></div>
+      </div>
+    </div>
   </div>
 
   <div class="box" style="margin-top: 14px;">
